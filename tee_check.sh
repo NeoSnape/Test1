@@ -14,7 +14,7 @@
 #  本脚本只读取信息, 不修改系统任何内容。兼容 mksh / toybox / dash / busybox。
 # ============================================================================
 
-VERSION="1.0"
+VERSION="1.1"
 
 # ---------------------------------------------------------------- 参数解析 --
 USE_COLOR=1
@@ -43,6 +43,8 @@ fi
 PASS=0; WARN=0; FAIL=0
 TEE_FOUND=""
 SB_FOUND=""
+ROOT_MGR=""
+FAKE_LOCK=""
 
 GETPROP=getprop
 command -v getprop >/dev/null 2>&1 || GETPROP=/system/bin/getprop
@@ -238,7 +240,11 @@ check_patch() {
 check_tee() {
     section "4. TEE 实现检测"
     probe_tee "Qualcomm QSEE / QTEE" \
-        "/dev/qseecom /dev/smcinvoke" "qseecomd" "libQSEEComAPI.so" ""
+        "/dev/qseecom /dev/smcinvoke" "qseecomd" "libQSEEComAPI.so" "" && IS_QCOM=1
+
+    # /dev/tee0 是 Linux 通用 TEE 子系统, 需看驱动区分 OP-TEE 与高通上游 QTEE 驱动
+    tee_drv=""
+    l=$(readlink /sys/class/tee/tee0/device/driver 2>/dev/null) && tee_drv=${l##*/}
     probe_tee "Trustonic Kinibi (<t-base)" \
         "/dev/mobicore /dev/mobicore-user /dev/t-base-tui" "mcDriverDaemon" \
         "libMcClient.so" "/vendor/app/mcRegistry"
@@ -246,9 +252,18 @@ check_tee() {
         "/dev/tzdev /dev/tziwsock" "tzdaemon tzts_daemon" "libteecl.so" "/vendor/tee"
     probe_tee "Huawei iTrustee" \
         "/dev/tc_ns_client /dev/tc_private /dev/tc_ns_cvm" "teecd" "libteec_vendor.so" ""
-    probe_tee "OP-TEE" \
-        "/dev/tee0 /dev/teepriv0" "tee-supplicant" "" \
-        "/vendor/lib/optee_armtz /data/vendor/tee"
+    case "$tee_drv" in
+        *optee*) is_optee=1 ;;
+        "")      [ "$IS_QCOM" = 1 ] && is_optee=0 || is_optee=1 ;;
+        *)       is_optee=0 ;;
+    esac
+    if [ "$is_optee" = 1 ]; then
+        probe_tee "OP-TEE" \
+            "/dev/tee0 /dev/teepriv0" "tee-supplicant" "" \
+            "/vendor/lib/optee_armtz /data/vendor/tee"
+    elif [ -e /dev/tee0 ]; then
+        info "通用 TEE 子系统 /dev/tee0 (驱动: ${tee_drv:-未知}): 高通平台上为 QTEE 的上游 Linux 驱动, 非 OP-TEE"
+    fi
     probe_tee "Google Trusty" \
         "/dev/trusty-ipc-dev0" "storageproxyd" "libtrusty.so" ""
     probe_tee "Microtrust / Beanpod ISEE (MTK)" \
@@ -276,7 +291,16 @@ check_tee() {
     probe_tee "Google Titan M / M2" "/dev/citadel0 /dev/gsc0" "citadeld gscd" "" "" && SB_FOUND="Titan M"
     probe_tee "Qualcomm SPU (安全处理单元)" "/dev/spcom" "spdaemon" "" "" && SB_FOUND="${SB_FOUND:+$SB_FOUND, }Qualcomm SPU"
     TEE_FOUND=$_tee_before
-    [ -z "$SB_FOUND" ] && info "未发现已知独立安全芯片 (三星/华为等可能使用 eSE, 见第 5 节 StrongBox 特性)"
+    # 通过 StrongBox HAL 服务名推断 eSE 厂商 (如 strongbox-thales / nxp / st)
+    sbh=$( { printf '%s\n' "$PS_OUT"; ls /vendor/bin/hw /vendor/bin 2>/dev/null; } \
+          | grep -iE 'strongbox' | sed 's/.*[ /]//' | sort -u | tr '\n' ' ')
+    if [ -n "$sbh" ]; then
+        vend=$(printf '%s' "$sbh" | grep -oiE 'thales|nxp|stm|st54|infineon|samsung|google|titan' | head -n 1)
+        hit "StrongBox eSE (嵌入式安全元件)${vend:+ 厂商: $vend}"
+        for e in $sbh; do printf '         └ %s\n' "$e"; done
+        SB_FOUND="${SB_FOUND:+$SB_FOUND, }eSE${vend:+ ($vend)}"
+    fi
+    [ -z "$SB_FOUND" ] && info "未发现已知独立安全芯片"
 }
 
 check_keymint() {
@@ -310,7 +334,11 @@ check_keymint() {
                  android.hardware.identity_credential \
                  android.software.secure_lock_screen; do
             v=$(fv "$f")
-            if [ -n "$v" ]; then kv "$f" "✔ ${v#*=}"; else kv "$f" "✘"; fi
+            case "$v" in
+                "")  kv "$f" "✘" ;;
+                *=*) kv "$f" "✔ (${v#*=})" ;;
+                *)   kv "$f" "✔" ;;
+            esac
         done
     else
         skip "无法执行 pm list features"
@@ -382,11 +410,15 @@ check_keymint() {
     printf '\n  %s相关系统属性:%s\n' "$W" "$N"
     for p in ro.hardware.keystore ro.hardware.keystore_desede ro.hardware.gatekeeper \
              ro.hardware.egl ro.crypto.state ro.crypto.type ro.crypto.metadata.enabled \
-             remote_provisioning.hostname keystore.boot_level; do
+             remote_provisioning.hostname remote_provisioning.tee.rkp_only \
+             remote_provisioning.strongbox.rkp_only keystore.boot_level; do
         v=$(gp "$p"); [ -n "$v" ] && kv "$p" "$v"
     done
     $GETPROP 2>/dev/null | grep -iE 'keymaster|keymint|strongbox|trusty|qsee|teegris|itrustee|tee\.|\.tee|attest' \
         | head -n 20 | sed 's/^/    /'
+
+    [ "$(gp remote_provisioning.tee.rkp_only)" = "true" ] && \
+        info "RKP-only: 证明密钥由 Google 远程配置服务器下发, 不使用出厂 keybox"
 
     cs=$(gp ro.crypto.state)
     case "$cs" in
@@ -423,9 +455,9 @@ check_root() {
         return
     fi
 
-    [ -d /data/adb/magisk ] && hit "Magisk ($(magisk -v 2>/dev/null) $(magisk -V 2>/dev/null))"
-    [ -d /data/adb/ksu ]    && hit "KernelSU ($(ksud -V 2>/dev/null || /data/adb/ksud -V 2>/dev/null))"
-    [ -d /data/adb/ap ]     && hit "APatch"
+    [ -d /data/adb/magisk ] && { hit "Magisk ($(magisk -v 2>/dev/null) $(magisk -V 2>/dev/null))"; ROOT_MGR="${ROOT_MGR:+$ROOT_MGR, }Magisk"; }
+    [ -d /data/adb/ksu ]    && { hit "KernelSU ($(ksud -V 2>/dev/null || /data/adb/ksud -V 2>/dev/null))"; ROOT_MGR="${ROOT_MGR:+$ROOT_MGR, }KernelSU"; }
+    [ -d /data/adb/ap ]     && { hit "APatch"; ROOT_MGR="${ROOT_MGR:+$ROOT_MGR, }APatch"; }
     [ -e /data/adb/ksu/.susfs ] || [ -e /data/adb/modules/susfs4ksu ] && hit "SUSFS"
 
     if [ -d /data/adb/modules ]; then
@@ -440,7 +472,9 @@ check_root() {
             [ -e "$mp/disable" ] && st=" (已禁用)"
             [ -e "$mp/remove" ] && st=" (待删除)"
             line="$m: ${name:-?} ${ver}$st"
-            if printf '%s %s\n' "$m" "$name" | grep -qiE 'tricky|integrity|pif|tee|keybox|attest|shamiko|zygisk|hide|susfs|spoof|bootloader|vbmeta'; then
+            printf '%s %s\n' "$m" "$name" | grep -qiE 'fake.?bl|fake.?lock|efisp|bootloader|vbmeta|回锁|锁定' \
+                && FAKE_LOCK="${FAKE_LOCK:+$FAKE_LOCK, }${name:-$m}"
+            if printf '%s %s\n' "$m" "$name" | grep -qiE 'tricky|integrity|pif|tee|keybox|attest|shamiko|zygisk|hide|susfs|spoof|bootloader|vbmeta|fake|efisp|回锁|锁定'; then
                 printf '    %s★ %s%s\n' "$Y" "$line" "$N"
             else
                 printf '    • %s\n' "$line"
@@ -466,6 +500,14 @@ check_root() {
         [ -f "$f" ] && kv "PIF 配置" "$f"
     done
 
+    # 有 root 却报告 green/locked: 锁定状态只能是在 Bootloader 层被伪装
+    vbs=$(gp ro.boot.verifiedbootstate)
+    if [ -n "$ROOT_MGR" ] && [ "$vbs" = "green" ]; then
+        warn "已安装 $ROOT_MGR 但启动状态为 green/locked: 真正锁定的官方系统无法 root,"
+        printf '         %s\n' "说明锁定状态在 Bootloader 层被伪装, 第 2 节的 PASS 不代表真实状态"
+        [ -n "$FAKE_LOCK" ] && printf '         %s\n' "相关模块: $FAKE_LOCK"
+    fi
+
     # 内核日志中的 TEE 信息
     printf '\n  %s内核日志 (TEE 相关, 最后 15 行):%s\n' "$W" "$N"
     dm=$(dmesg 2>/dev/null | grep -iE 'qseecom|smcinvoke|optee|trusty|mobicore|tzdev|teegris|tc_ns|teei|isee|citadel|keymaster|keymint|tee_' | tail -n 15)
@@ -478,7 +520,7 @@ summary() {
     section "8. 总结"
     kv "检测到的 TEE" "${TEE_FOUND:-未识别}"
     kv "StrongBox 安全芯片" "${SB_FOUND:-未发现}"
-    kv "启动验证状态" "$(gp ro.boot.verifiedbootstate)"
+    kv "启动验证状态" "$(gp ro.boot.verifiedbootstate)${ROOT_MGR:+ (已 root: $ROOT_MGR, 状态为伪装)}"
     printf '  %sPASS: %d%s   %sWARN: %d%s   %sFAIL: %d%s\n' \
         "$G" "$PASS" "$N" "$Y" "$WARN" "$N" "$R" "$FAIL" "$N"
     cat <<EOF
